@@ -376,6 +376,12 @@ fi
 systemctl enable --now docker
 docker compose version
 
+echo "[LXC] Alten Stack stoppen/entfernen (sauberer Re-Run; Volumes mit DB bleiben erhalten) ..."
+systemctl stop windmill 2>/dev/null || true
+if [[ -f /opt/windmill/docker-compose.yml ]]; then
+  docker compose -f /opt/windmill/docker-compose.yml down --remove-orphans 2>/dev/null || true
+fi
+
 echo "[LXC] /opt/windmill mit Upstream Compose-Dateien bestuecken ..."
 mkdir -p /opt/windmill
 BASE="https://raw.githubusercontent.com/\$UPSTREAM_REPO/\$UPSTREAM_REF"
@@ -397,6 +403,33 @@ grep -q "80:80" /opt/windmill/docker-compose.yml || {
   echo "[LXC][WARN] Port-Mapping 80:80 nicht gefunden – Caddy-Block pruefen:"
   grep -n "ports:" -A4 /opt/windmill/docker-compose.yml || true
 }
+
+# 'version:' ist obsolet (nur Compose-Warnrauschen) – entfernen
+sed -i '/^version:/d' /opt/windmill/docker-compose.yml
+
+echo "[LXC] Port-Belegung pruefen (:80 Pflicht, :25 optional/nur E-Mail-Trigger) ..."
+if ss -ltn | grep -Eq ':80[[:space:]]'; then
+  echo "[LXC][ERROR] Host-Port 80 ist bereits belegt – Caddy kann die Web UI nicht binden." >&2
+  echo "--- ss -ltnp (Belegung) ---" >&2
+  ss -ltnp 2>&1 >&2 || true
+  echo "[LXC][HINT] Prozess auf :80 stoppen (oder Caddy-Ports in /opt/windmill/docker-compose.yml ummappen), dann Installer erneut laufen lassen." >&2
+  exit 1
+fi
+if ss -ltn | grep -Eq ':25[[:space:]]'; then
+  echo "[LXC][WARN] Host-Port 25 ist belegt – Caddy wuerde damit nicht starten (failed to bind host port 0.0.0.0:25)."
+  echo "[LXC][WARN] Belegung:"
+  ss -ltnp 2>/dev/null | grep -E ':25[[:space:]]' || true
+  echo "[LXC][WARN] Deaktiviere SMTP-Mapping 25:25 (nur fuer Windmill E-Mail-Trigger noetig)."
+  sed -i -E 's/^([[:space:]]+)- 25:25[[:space:]]*$/\1# - 25:25  # vom Installer deaktiviert: Host-Port 25 belegt (E-Mail-Trigger optional)/' /opt/windmill/docker-compose.yml
+  if grep -Eq '^[[:space:]]+-[[:space:]]+25:25' /opt/windmill/docker-compose.yml; then
+    echo "[LXC][ERROR] 25:25-Mapping konnte nicht deaktiviert werden." >&2
+    grep -n "25:25" /opt/windmill/docker-compose.yml >&2 || true
+    exit 1
+  fi
+  echo "[LXC][WARN] E-Mail-Trigger (SMTP :25) bleiben aus – Web UI, API und alle anderen Trigger laufen normal."
+else
+  echo "[LXC] Ports 80 und 25 frei."
+fi
 
 echo "[LXC] systemd-Unit windmill.service schreiben ..."
 cat > /etc/systemd/system/windmill.service <<UNIT_INNER_EOF
@@ -498,6 +531,9 @@ echo -e "  Web UI       : ${C_BOLD}http://<LXC-IP>${C_RESET} (IP konnte nicht au
 fi
 echo -e "  Login        : admin@windmill.dev / changeme (nach erstem Login ändern!)"
 echo -e "  API-Check    : im Container: curl -fs http://127.0.0.1:8000/api/version"
+if pct exec "$CTID" -- grep -Eq '^[[:space:]]*#[[:space:]]*-[[:space:]]*25:25' /opt/windmill/docker-compose.yml 2>/dev/null; then
+echo -e "  SMTP-Trigger : ${C_YELLOW}deaktiviert${C_RESET} (Host-Port 25 war belegt) – E-Mail-Trigger aus, Rest läuft normal"
+fi
 if [[ "$CREATED_NOW" == "1" && "$GENERATED_PW" == "1" ]]; then
 echo -e "  Root-Passwort: ${C_BOLD}${ROOT_PASSWORD}${C_RESET} (nur jetzt angezeigt – sicher ablegen!)"
 fi

@@ -54,6 +54,9 @@ Das Skript (`set -euo pipefail`, idempotent):
    legt `/opt/windmill/{docker-compose.yml,Caddyfile,.env}` von Upstream ab
    (dabei `WM_IMAGE` auf `ghcr.io/windmill-labs/windmill:latest` gepinnt),
    schreibt die systemd-Unit, `systemctl enable --now windmill`,
+   Vor dem Start: alter Stack per `down` entfernen (sauberer Re-Run, DB-Volume
+   bleibt), `:80` muss frei sein (sonst Fail-Fast mit `ss`-Belegung), belegtes
+   `:25` deaktiviert automatisch nur das SMTP-Mapping für E-Mail-Trigger,
 5. verifiziert `systemctl is-active windmill` + `curl http://127.0.0.1/` +
    `:8000/api/version` und gibt die finale URL `http://<LXC-IP>` aus.
 
@@ -154,9 +157,21 @@ damit der Einzeiler ohne weitere Dateien auskommt (1:1 identisch).
   wartet bis zu ~300 s. Einfach laufen lassen, nicht abbrechen.
 - **Login:** `admin@windmill.dev` / `changeme` — sofort nach erstem Login ändern
   (Superadmin → Settings). SMTP/SSO/OAuth ebenfalls dort konfigurierbar.
-- **Port belegt?** Falls Port 80 auf der Container-IP kollidiert, im Container
+- **Port 80 belegt?** Der Installer bricht fail-fast mit `ss -ltnp`-Belegung ab.
+  Falls Port 80 auf der Container-IP kollidiert, im Container
   `/opt/windmill/docker-compose.yml` (`80:80` → `8080:80`) und `BASE_URL` in der
   Caddy-Sektion anpassen, dann `systemctl restart windmill`.
+- **Port 25 belegt?** (typischer Erstlauf-Fehler im Docker-Log:
+  `failed to bind host port 0.0.0.0:25/tcp: address already in use` → Caddy
+  startet gar nicht, `:80` bleibt tot.) Der Installer kommentiert dann `25:25`
+  automatisch aus und meldet `SMTP-Trigger: deaktiviert`. Web UI, API, Worker
+  und alle Trigger außer E-Mail laufen normal. Wer E-Mail-Trigger braucht:
+  Prozess auf `:25` finden (`pct exec <CT> -- ss -ltnp | grep :25`),
+  stoppen/deinstallieren, dann Installer erneut laufen lassen (stellt das
+  Mapping wieder her, da Compose-Dateien neu geladen werden).
+- **Recovery nach Fehlschlag:** Einfach den Installer erneut laufen lassen
+  (`bash windmill.sh --ctid <CT>`) — er macht `down`, lädt Compose neu,
+  behebt Port-Konflikte wie oben und verifiziert erneut. DB-Volume bleibt erhalten.
 - **LXC-Rechte:** unprivilegiert + `nesting=1` reicht für Docker-in-LXC.
   Der Windmill-Worker läuft compose-intern ohnehin `privileged: true`
   (Upstream-Default für nsjail/PID-Isolation) — das ist Container-in-Container
