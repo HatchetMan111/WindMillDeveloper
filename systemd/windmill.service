@@ -1,0 +1,17 @@
+[Unit]
+Description=Windmill - Developer platform for APIs, workflows and UIs (Docker Compose)
+Documentation=https://www.windmill.dev/docs/advanced/self_host
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/windmill
+ExecStart=/usr/bin/docker compose -f /opt/windmill/docker-compose.yml up
+ExecStop=/usr/bin/docker compose -f /opt/windmill/docker-compose.yml stop
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
