@@ -28,7 +28,7 @@ WM_IMAGE_DEFAULT="ghcr.io/windmill-labs/windmill:latest"
 DEFAULT_CORES="4"                             # Windmill braucht mehr als 1–2 vCPU
 DEFAULT_RAM="8192"                            # Server + 3 Worker + DB + Caddy (MB)
 DEFAULT_SWAP="1024"                           # Swap (MB)
-DEFAULT_DISK="20"                             # Images (~3 GB) + DB + Cache (GB)
+DEFAULT_DISK="32"                             # Images (~3 GB) + DB + Logs + Cache (GB)
 DEFAULT_BRIDGE="vmbr0"
 DEFAULT_TEMPLATE_STORE="local"                # Storage für CT-Templates
 DEFAULT_OS="debian-12-standard"               # Template-Familie (12 = stabil getestet)
@@ -131,7 +131,7 @@ on_error() {
     pct exec "${CTID}" -- journalctl -u docker --no-pager -n 50 2>&1 || true
     echo ""
     msg_error "--- docker compose ps / logs (Tail 100) ---"
-    pct exec "${CTID}" -- docker compose -f /opt/windmill/docker-compose.yml ps 2>&1 || true
+    pct exec "${CTID}" -- docker compose -f /opt/windmill/docker-compose.yml ps -a 2>&1 || true
     pct exec "${CTID}" -- docker compose -f /opt/windmill/docker-compose.yml logs --tail=100 2>&1 || true
   fi
   echo ""
@@ -235,6 +235,8 @@ if [[ -z "$STORAGE_ARG" ]]; then
 else
   msg_info "RootFS-Storage (vorgegeben): $STORAGE_ARG"
 fi
+msg_info "Storage-Belegung (Host) – hier muss die CT-Disk (${DISK}G) Platz haben:"
+pvesm status --storage "$STORAGE_ARG" 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # Template sicherstellen
@@ -407,6 +409,12 @@ grep -q "80:80" /opt/windmill/docker-compose.yml || {
 # 'version:' ist obsolet (nur Compose-Warnrauschen) – entfernen
 sed -i '/^version:/d' /opt/windmill/docker-compose.yml
 
+# pull_policy 'always' entfernen: sonst zieht JEDES 'up' (auch nach Reboot)
+# alle Images (~2-3 GB) erneut – auf langsamen Links bleibt 'up' minutenlang
+# in der Pull-Phase und erstellt keine Container. Updates laufen explizit per
+# 'docker compose pull' weiter unten (Default-Policy 'missing' reicht).
+sed -i '/^[[:space:]]*pull_policy:/d' /opt/windmill/docker-compose.yml
+
 echo "[LXC] Port-Belegung pruefen (:80 Pflicht, :25 optional/nur E-Mail-Trigger) ..."
 if ss -ltn | grep -Eq ':80[[:space:]]'; then
   echo "[LXC][ERROR] Host-Port 80 ist bereits belegt – Caddy kann die Web UI nicht binden." >&2
@@ -438,10 +446,34 @@ UNIT_INNER_EOF
 
 systemctl daemon-reload
 systemctl enable windmill
-echo "[LXC] Images ziehen (kann beim ersten Mal mehrere Minuten dauern) ..."
-docker compose -f /opt/windmill/docker-compose.yml pull || {
-  echo "[LXC][WARN] 'docker compose pull' meldete Fehler – versuche trotzdem zu starten."
-}
+echo "[LXC] Plattenplatz pruefen (Images ~3 GB + DB + Logs brauchen Luft, Minimum 8 GB frei) ..."
+FREE_KB=\$(df --output=avail -k /var/lib/docker 2>/dev/null | tail -n1 | tr -d ' ' || df --output=avail -k / | tail -n1 | tr -d ' ')
+FREE_KB="\${FREE_KB:-0}"
+echo "[LXC] Frei: \$((FREE_KB / 1024 / 1024)) GB"
+if [[ "\$FREE_KB" -lt 8388608 ]]; then
+  echo "[LXC][ERROR] Zu wenig freier Plattenplatz (< 8 GB) – Docker-Pulls bleiben sonst stehen (Extracting kriecht, keine Container)." >&2
+  echo "--- df -h ---" >&2
+  df -h / /var/lib/docker 2>&1 >&2 || true
+  echo "--- docker system df ---" >&2
+  docker system df 2>&1 >&2 || true
+  echo "[LXC][HINT] CT-Disk vergroessern (auf dem Host): pct resize <CTID> rootfs +<GB>G – oder 'docker system prune -af' (Images werden neu gezogen, Volumes bleiben)." >&2
+  exit 1
+fi
+echo "[LXC] Images ziehen (kann beim ersten Mal mehrere Minuten dauern; Resume bei Abbruch, max. 3 Versuche) ..."
+PULL_OK=0
+for attempt in 1 2 3; do
+  if docker compose -f /opt/windmill/docker-compose.yml pull; then PULL_OK=1; break; fi
+  echo "[LXC][WARN] 'docker compose pull' Versuch \$attempt/3 fehlgeschlagen – neuer Versuch in 10s ..."
+  sleep 10
+done
+if [[ "\$PULL_OK" != "1" ]]; then
+  echo "[LXC][ERROR] Images konnten nach 3 Versuchen nicht geladen werden (Registry-Link oder Platte voll?)." >&2
+  echo "--- df -h ---" >&2
+  df -h / /var/lib/docker 2>&1 >&2 || true
+  echo "--- docker system df ---" >&2
+  docker system df 2>&1 >&2 || true
+  exit 1
+fi
 if systemctl is-active --quiet windmill; then
   systemctl restart windmill
 else
@@ -457,7 +489,7 @@ for i in \$(seq 1 60); do
   if [[ "\$OK_WEB" == "1" && "\$OK_API" == "1" ]]; then break; fi
   if [[ \$((i % 6)) -eq 0 ]]; then
     echo "[LXC] ... noch nicht bereit nach \$((i * 5))s (Web=\$OK_WEB API=\$OK_API), docker compose ps:"
-    docker compose -f /opt/windmill/docker-compose.yml ps || true
+    docker compose -f /opt/windmill/docker-compose.yml ps -a || true
   fi
   sleep 5
 done
@@ -466,14 +498,14 @@ if [[ "\$OK_WEB" != "1" ]]; then
   echo "--- systemctl status windmill ---" >&2
   systemctl status windmill --no-pager --full >&2 || true
   echo "--- docker compose ps ---" >&2
-  docker compose -f /opt/windmill/docker-compose.yml ps >&2 || true
+  docker compose -f /opt/windmill/docker-compose.yml ps -a >&2 || true
   echo "--- docker compose logs (Tail 100) ---" >&2
   docker compose -f /opt/windmill/docker-compose.yml logs --tail=100 >&2 || true
   exit 1
 fi
 if [[ "\$OK_API" != "1" ]]; then
   echo "[LXC][WARN] Caddy antwortet, aber Backend :8000/api/version noch nicht – laeuft ggf. noch warm."
-  docker compose -f /opt/windmill/docker-compose.yml ps || true
+  docker compose -f /opt/windmill/docker-compose.yml ps -a || true
 fi
 echo "[LXC] Web UI antwortet (Version: \$(curl -fsS --max-time 5 http://127.0.0.1:8000/api/version || echo unbekannt))."
 echo "[LXC] Service aktiv: \$(systemctl is-active windmill)"
@@ -503,7 +535,7 @@ if [[ "$SERVICE_STATE" != "active" ]]; then
   msg_error "Service-Check fehlgeschlagen: 'systemctl is-active $APP' = '$SERVICE_STATE' (erwartet: active)"
   pct exec "$CTID" -- systemctl status "$APP" --no-pager --full || true
   pct exec "$CTID" -- journalctl -u "$APP" --no-pager -n 100 || true
-  pct exec "$CTID" -- docker compose -f /opt/windmill/docker-compose.yml ps || true
+  pct exec "$CTID" -- docker compose -f /opt/windmill/docker-compose.yml ps -a || true
   exit 1
 fi
 msg_ok "Service läuft (systemctl is-active $APP = active)."

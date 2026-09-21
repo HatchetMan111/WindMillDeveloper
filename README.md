@@ -17,7 +17,7 @@ systemd-Service mit `Restart=always`, Container mit `onboot=1`.
 | Web UI | `http://<LXC-IP>` (Caddy auf Port 80, bind `0.0.0.0`) |
 | API-Check | `http://<LXC-IP>:8000/api/version` nur **im** Container; von außen: `http://<LXC-IP>/` |
 | Standard-Login | `admin@windmill.dev` / `changeme` (nach erstem Login ändern!) |
-| Standard-Ressourcen | 4 vCPU / 8192 MB RAM / 20 GB Disk |
+| Standard-Ressourcen | 4 vCPU / 8192 MB RAM / 32 GB Disk |
 | CT-ID | immer die **nächste freie ID** (`pvesh get /cluster/nextid`), außer `--ctid` gesetzt |
 | Template | `debian-12-standard` (neuestes auf Storage `local`) |
 
@@ -25,7 +25,7 @@ systemd-Service mit `Restart=always`, Container mit `onboot=1`.
 > Upstream-Compose startet Postgres + Server + 3 Worker + Native-Worker + Caddy.
 > Faustregel von Windmill: 1 Worker pro vCPU, 1–2 GB RAM pro Worker.
 > Mit 2 CPU / 4 GB bootet die UI zwar, echte Workflows laufen aber ins OOM —
-> daher sind 4/8/20 der Standard; per Flags jederzeit anpassbar.
+> daher sind 4 CPU / 8 GB / 32 GB der Standard; per Flags jederzeit anpassbar.
 
 ## 1. Installation (Einzeiler, auf dem Proxmox-Host als root)
 
@@ -57,6 +57,9 @@ Das Skript (`set -euo pipefail`, idempotent):
    Vor dem Start: alter Stack per `down` entfernen (sauberer Re-Run, DB-Volume
    bleibt), `:80` muss frei sein (sonst Fail-Fast mit `ss`-Belegung), belegtes
    `:25` deaktiviert automatisch nur das SMTP-Mapping für E-Mail-Trigger,
+   Upstream-`pull_policy: always` wird entfernt (sonst zieht jedes `up` alle
+   Images erneut), Images werden explizit mit Retry (3 Versuche) gezogen,
+   vorher Platten-Check (min. 8 GB frei, sonst Fail-Fast),
 5. verifiziert `systemctl is-active windmill` + `curl http://127.0.0.1/` +
    `:8000/api/version` und gibt die finale URL `http://<LXC-IP>` aus.
 
@@ -69,7 +72,7 @@ Erwartete Schlussausgabe (Beispiel):
 ════════════════ INSTALLATION ERFOLGREICH ════════════════
   App          : Windmill – APIs, Workflows & UIs
   Container    : CT 100 (Hostname: windmill, onboot=1)
-  Ressourcen   : 4 vCPU / 8192 MB RAM / 20 GB Disk
+  Ressourcen   : 4 vCPU / 8192 MB RAM / 32 GB Disk
   Image        : ghcr.io/windmill-labs/windmill:latest (Upstream-Ref: main)
   Web UI       : http://192.168.1.100
   Login        : admin@windmill.dev / changeme (nach erstem Login ändern!)
@@ -172,6 +175,15 @@ damit der Einzeiler ohne weitere Dateien auskommt (1:1 identisch).
 - **Recovery nach Fehlschlag:** Einfach den Installer erneut laufen lassen
   (`bash windmill.sh --ctid <CT>`) — er macht `down`, lädt Compose neu,
   behebt Port-Konflikte wie oben und verifiziert erneut. DB-Volume bleibt erhalten.
+- **Bootdisk / CT-Disk voll?** Voller Plattenplatz lässt Docker-Pulls stehen
+  (`Extracting` kriecht byte-weise, `compose ps -a` bleibt leer) — der Installer
+  prüft vorher (min. 8 GB frei) und bricht fail-fast ab. Diagnose:
+  Host: `df -h`, `pvesm status`; Container: `pct exec <CT> -- df -h` und
+  `docker system df`. Abhilfe: Host aufräumen (alte ISOs/Templates/Backups unter
+  `/var/lib/vz/`, `apt-get clean`), CT-Disk vergrößern
+  (`pct stop <CT> && pct resize <CT> rootfs +<GB>G && pct start <CT>` —
+  braucht freie Extents im Storage) oder im CT `docker system prune -af`
+  (Volumes bleiben, Images werden neu gezogen). Standard ist jetzt 32 GB.
 - **LXC-Rechte:** unprivilegiert + `nesting=1` reicht für Docker-in-LXC.
   Der Windmill-Worker läuft compose-intern ohnehin `privileged: true`
   (Upstream-Default für nsjail/PID-Isolation) — das ist Container-in-Container
